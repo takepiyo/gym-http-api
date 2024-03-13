@@ -26,6 +26,7 @@ class Client(object):
             # error.
             resp.raise_for_status()
         if resp.status_code != 200 and "message" in j:  # descriptive message from server side
+            print(resp)
             raise ServerError(message=j["message"], status_code=resp.status_code)
         resp.raise_for_status()
         return j
@@ -42,10 +43,10 @@ class Client(object):
         logger.info("GET {}".format(url))
         resp = self.session.get(url)
         return self._parse_server_error_or_raise_for_status(resp)
-        
-    def env_create(self, env_id):
+
+    def env_create(self, env_id, render_mode):
         route = '/v1/envs/'
-        data = {'env_id': env_id}
+        data = {'env_id': env_id, 'render_mode': render_mode}
         resp = self._post_request(route, data)
         instance_id = resp['instance_id']
         return instance_id
@@ -68,9 +69,10 @@ class Client(object):
         resp = self._post_request(route, data)
         observation = resp['observation']
         reward = resp['reward']
-        done = resp['done']
+        terminated = resp['terminated']
+        truncated = resp['truncated']
         info = resp['info']
-        return [observation, reward, done, info]
+        return [observation, reward, terminated, truncated, info]
 
     def env_action_space_info(self, instance_id):
         route = '/v1/envs/{}/action_space/'.format(instance_id)
@@ -145,8 +147,9 @@ if __name__ == '__main__':
     client = Client(remote_base)
 
     # Create environment
-    env_id = 'CartPole-v0'
-    instance_id = client.env_create(env_id)
+    env_id = 'CartPole-v1'
+    render_mode = 'human'
+    instance_id = client.env_create(env_id, render_mode)
 
     # Check properties
     all_envs = client.env_list_all()
@@ -154,8 +157,5 @@ if __name__ == '__main__':
     obs_info = client.env_observation_space_info(instance_id)
 
     # Run a single step
-    client.env_monitor_start(instance_id, directory='tmp', force=True)
     init_obs = client.env_reset(instance_id)
-    [observation, reward, done, info] = client.env_step(instance_id, 1, True)
-    client.env_monitor_close(instance_id)
-    client.upload(training_dir='tmp')
+    [observation, reward, terminated, truncated, info] = client.env_step(instance_id, 1, True)

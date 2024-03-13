@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from flask import Flask, request, jsonify
 import uuid
-import gym
+import gymnasium as gym
 import numpy as np
 import six
 import argparse
@@ -12,6 +12,8 @@ import json
 import logging
 logger = logging.getLogger('werkzeug')
 logger.setLevel(logging.ERROR)
+
+# import threading as th
 
 ########## Container for environments ##########
 class Envs(object):
@@ -41,9 +43,9 @@ class Envs(object):
         except KeyError:
             raise InvalidUsage('Instance_id {} unknown'.format(instance_id))
 
-    def create(self, env_id, seed=None):
+    def create(self, env_id, render_mode, seed=None):
         try:
-            env = gym.make(env_id)
+            env = gym.make(env_id, render_mode=render_mode)
             if seed:
                 env.seed(seed)
         except gym.error.Error:
@@ -58,20 +60,21 @@ class Envs(object):
 
     def reset(self, instance_id):
         env = self._lookup_env(instance_id)
-        obs = env.reset()
-        return env.observation_space.to_jsonable(obs)
+        obs, info = env.reset()
+        obs_jsonable = env.observation_space.to_jsonable(obs)
+        return [obs_jsonable, info]
 
     def step(self, instance_id, action, render):
         env = self._lookup_env(instance_id)
-        if isinstance( action, six.integer_types ):
+        if isinstance(action, six.integer_types):
             nice_action = action
         else:
             nice_action = np.array(action)
         if render:
             env.render()
-        [observation, reward, done, info] = env.step(nice_action)
+        [observation, reward, terminated, truncated, info] = env.step(nice_action)
         obs_jsonable = env.observation_space.to_jsonable(observation)
-        return [obs_jsonable, reward, done, info]
+        return [obs_jsonable, reward, terminated, truncated, info]
 
     def get_action_space_contains(self, instance_id, x):
         env = self._lookup_env(instance_id)
@@ -122,7 +125,27 @@ class Envs(object):
         elif info['name'] == 'HighLow':
             info['num_rows'] = space.num_rows
             info['matrix'] = [((float(x) if x != -np.inf else -1e100) if x != +np.inf else +1e100) for x in np.array(space.matrix).flatten()]
+        info = self.convert_to_python_types(info)
         return info
+
+    def convert_to_python_types(self, obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, np.int64):
+                    obj[key] = int(value)
+                elif isinstance(value, np.float32):
+                    obj[key] = float(value)
+                elif isinstance(value, list):
+                    converted_list = []
+                    for v in value:
+                        if isinstance(v, np.int64):
+                            converted_list.append(int(v))
+                        elif isinstance(v, np.float32):
+                            converted_list.append(float(v))
+                    obj[key] = converted_list
+                elif isinstance(value, dict):
+                    self.convert_to_python_types(value)
+        return obj
 
     def monitor_start(self, instance_id, directory, force, resume, video_callable):
         env = self._lookup_env(instance_id)
@@ -130,7 +153,7 @@ class Envs(object):
             v_c = lambda count: False
         else:
             v_c = lambda count: count % video_callable == 0
-        self.envs[instance_id] = gym.wrappers.Monitor(env, directory, force=force, resume=resume, video_callable=v_c) 
+        self.envs[instance_id] = gym.wrappers.RecordVideo(env, video_folder=directory, episode_trigger=v_c)
 
     def monitor_close(self, instance_id):
         env = self._lookup_env(instance_id)
@@ -202,8 +225,9 @@ def env_create():
         manipulated
     """
     env_id = get_required_param(request.get_json(), 'env_id')
+    render_mode = get_required_param(request.get_json(), 'render_mode')
     seed = get_optional_param(request.get_json(), 'seed', None)
-    instance_id = envs.create(env_id, seed)
+    instance_id = envs.create(env_id, render_mode, seed)
     return jsonify(instance_id = instance_id)
 
 @app.route('/v1/envs/', methods=['GET'])
@@ -231,7 +255,7 @@ def env_reset(instance_id):
     Returns:
         - observation: the initial observation of the space
     """
-    observation = envs.reset(instance_id)
+    observation, info = envs.reset(instance_id)
     if np.isscalar(observation):
         observation = observation.item()
     return jsonify(observation = observation)
@@ -255,9 +279,10 @@ def env_step(instance_id):
     json = request.get_json()
     action = get_required_param(json, 'action')
     render = get_optional_param(json, 'render', False)
-    [obs_jsonable, reward, done, info] = envs.step(instance_id, action, render)
+    # print(f'{th.get_ident()=}')
+    [obs_jsonable, reward, terminated, truncated, info] = envs.step(instance_id, action, render)
     return jsonify(observation = obs_jsonable,
-                    reward = reward, done = done, info = info)
+                    reward = reward, terminated = terminated, truncated = truncated, info = info)
 
 @app.route('/v1/envs/<instance_id>/action_space/', methods=['GET'])
 def env_action_space_info(instance_id):
@@ -287,7 +312,7 @@ def env_action_space_sample(instance_id):
     Returns:
 
     	- action: a randomly sampled element belonging to the action_space
-    """  
+    """
     action = envs.get_action_space_sample(instance_id)
     return jsonify(action = action)
 
@@ -295,14 +320,14 @@ def env_action_space_sample(instance_id):
 def env_action_space_contains(instance_id, x):
     """
     Assess that value is a member of the env's action_space
-    
+
     Parameters:
         - instance_id: a short identifier (such as '3c657dbc')
         for the environment instance
 	    - x: the value to be checked as member
     Returns:
         - member: whether the value passed as parameter belongs to the action_space
-    """  
+    """
 
     member = envs.get_action_space_contains(instance_id, x)
     return jsonify(member = member)
@@ -413,6 +438,7 @@ def upload():
     except gym.error.AuthenticationError:
         raise InvalidUsage('You must provide an OpenAI Gym API key')
 
+
 @app.route('/v1/shutdown/', methods=['POST'])
 def shutdown():
     """ Request a server shutdown - currently used by the integration tests to repeatedly create and destroy fresh copies of the server running in a separate thread"""
@@ -420,11 +446,14 @@ def shutdown():
     f()
     return 'Server shutting down'
 
+
 if __name__ == '__main__':
+    # print(f'{th.get_ident()=}')
+
     parser = argparse.ArgumentParser(description='Start a Gym HTTP API server')
     parser.add_argument('-l', '--listen', help='interface to listen to', default='127.0.0.1')
     parser.add_argument('-p', '--port', default=5000, type=int, help='port to bind to')
 
     args = parser.parse_args()
     print('Server starting at: ' + 'http://{}:{}'.format(args.listen, args.port))
-    app.run(host=args.listen, port=args.port)
+    app.run(host=args.listen, port=args.port, threaded=False)
